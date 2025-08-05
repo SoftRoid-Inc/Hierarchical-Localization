@@ -19,7 +19,13 @@ from .utils.geometry import compute_epipolar_errors
 
 NOT_EXPO_COLMAP_CFGS = {
     "init_max_error": "--Mapper.init_max_error",
+    "init_max_forward_motion": "--Mapper.init_max_forward_motion",
+    "init_max_req_trials": "--Mapper.init_max_req_trials",
+
     "abs_pose_max_error": "--Mapper.abs_pose_max_error",
+    "abs_pose_min_num_inliers": "--Mapper.abs_pose_min_num_inliers",
+    "abs_pose_min_inlier_ratio": "--Mapper.abs_pose_min_inlier_ratio",
+
     "filter_max_reproj_error": "--Mapper.filter_max_reproj_error",
     "tri_merge_max_reproj_error": "--Mapper.tri_merge_max_reproj_error",
     "tri_create_max_angle_error": "--Mapper.tri_create_max_angle_error",
@@ -27,10 +33,13 @@ NOT_EXPO_COLMAP_CFGS = {
     "tri_complete_max_reproj_error": "--Mapper.tri_complete_max_reproj_error",
 
     'ba_global_images_ratio': "--Mapper.ba_global_images_ratio",
+    'ba_global_points_ratio': "--Mapper.ba_global_points_ratio",
     'ba_global_max_num_iterations': "--Mapper.ba_global_max_num_iterations",
     'ba_global_max_refinements' : "--Mapper.ba_global_max_refinements",
+
     "multiple_models": "--Mapper.multiple_models",
     "max_num_models": "--Mapper.max_num_models",
+    'min_model_size': "--Mapper.min_model_size",
     "tri_ignore_two_view_tracks": "--Mapper.tri_ignore_two_view_tracks"
 }
 
@@ -212,7 +221,10 @@ def geometric_verification(image_ids, reference, database_path, features_path,
 def run_triangulation(model_path, database_path, image_dir, reference_model, colmap_configs=None,
                       verbose=False):
     model_path.mkdir(parents=True, exist_ok=True)
-    mapper_options = pycolmap.IncrementalMapperOptions(ba_global_use_pba=colmap_configs['use_pba'])
+    if colmap_configs["use_pba"]:
+        mapper_options = pycolmap.IncrementalMapperOptions(ba_global_use_pba=colmap_configs['use_pba'])
+    else:
+        mapper_options = pycolmap.IncrementalMapperOptions()
     logger.info('Running 3D triangulation...')
     with OutputCapture(verbose):
         with pycolmap.ostream():
