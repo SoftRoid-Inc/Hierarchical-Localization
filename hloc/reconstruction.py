@@ -141,9 +141,13 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs=None, v
     logger.info(f"Models sorted by number of registered images: {sorted_models[0][0]} with {sorted_models[0][1].num_reg_images()} images.")
     delete_models = []
     for k in reversed(range(1, len(sorted_models))):
+        small_idx, _ = sorted_models[k]
+        small_rec = pycolmap.Reconstruction(models_path/str(small_idx))
+
         for i in reversed(range(0, k)):
-            big_idx, big_rec = sorted_models[i]
-            small_idx, small_rec = sorted_models[k]
+            big_idx, _ = sorted_models[i]
+            big_rec = pycolmap.Reconstruction(models_path/str(big_idx))
+
             common_images = big_rec.find_common_reg_image_ids(small_rec)
             logger.info(f'Model #{big_idx} and #{small_idx} have {len(common_images)} common images.')
             if len(common_images) > 2:
@@ -157,7 +161,6 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs=None, v
     logger.info("Merge reconstruction models with common images...")
     logger.info(f"省略できたモデル: {delete_models}")
     logger.info(f"biggest new model:{sorted_models[0][0]} images: {pycolmap.Reconstruction(models_path/str(sorted_models[0][0])).num_reg_images()}")
-
 
     os.system(f"mv {models_path}/* {sfm_dir}")
     os.system(f"rm -rf {models_path}")
@@ -175,11 +178,11 @@ def merge_reconstruction(input_path1, input_path2, output_path, log_path):
     cmd2 += ["--output_path", str(output_path)]
 
     colmap_res = subprocess.run(cmd, capture_output=True)
-    logger.info(' '.join(cmd))
+    # logger.info(' '.join(cmd))
     with open(osp.join(log_path, "output.txt"), "a") as f:
         f.write(colmap_res.stdout.decode())
     colmap_res = subprocess.run(cmd2, capture_output=True)
-    logger.info(' '.join(cmd2))
+    # logger.info(' '.join(cmd2))
     with open(osp.join(log_path, "output.txt"), "a") as f:
         f.write(colmap_res.stdout.decode())
 
