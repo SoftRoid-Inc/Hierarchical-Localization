@@ -106,14 +106,10 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs=None, v
                 "0",
             ]
 
-        if verbose:
-            logger.info(' '.join(cmd))
-            colmap_res = subprocess.run(cmd)
-        else:
-            logger.info(' '.join(cmd))
-            colmap_res = subprocess.run(cmd, capture_output=True)
-            with open(osp.join(models_path, "output.txt"), "w") as f:
-                f.write(colmap_res.stdout.decode())
+        logger.info(' '.join(cmd))
+        colmap_res = subprocess.run(cmd, capture_output=True)
+        with open(osp.join(models_path, "output.txt"), "w") as f:
+            f.write(colmap_res.stdout.decode())
 
         reconstructions = {}
         for id, model_path in enumerate(sorted(models_path.glob('*'))):
@@ -139,6 +135,7 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs=None, v
 
     sorted_models = sorted(reconstructions.items(), key=lambda x: x[1].num_reg_images(), reverse=True)
     logger.info(f"Models sorted by number of registered images: {sorted_models[0][0]} with {sorted_models[0][1].num_reg_images()} images.")
+    logger.info(f"model sizes {[(f'{idx}: {rec.num_reg_images()}') for idx, rec in sorted_models]}")
     delete_models = []
     for k in reversed(range(1, len(sorted_models))):
         small_idx, _ = sorted_models[k]
@@ -151,8 +148,8 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs=None, v
             common_images = big_rec.find_common_reg_image_ids(small_rec)
             logger.info(f'Model #{big_idx} and #{small_idx} have {len(common_images)} common images.')
             if len(common_images) > 2:
-                merge_reconstruction(models_path/str(big_idx), models_path/str(small_idx), models_path/str(big_idx), models_path)
-                delete_models.append(small_idx)
+                if merge_reconstruction(models_path/str(big_idx), models_path/str(small_idx), models_path/str(big_idx), models_path):
+                    delete_models.append(small_idx)
 
             # logger.info(f'Model #{index} has {rec.num_reg_images()} images.')
     for idx in delete_models:
@@ -179,12 +176,18 @@ def merge_reconstruction(input_path1, input_path2, output_path, log_path):
 
     colmap_res = subprocess.run(cmd, capture_output=True)
     # logger.info(' '.join(cmd))
+    merge_output = colmap_res.stdout.decode()
     with open(osp.join(log_path, "output.txt"), "a") as f:
-        f.write(colmap_res.stdout.decode())
+        f.write(merge_output)
+
+    if "Merge failed" in merge_output:
+        logger.error(f"Merge failed: {merge_output}")
+        return False
     colmap_res = subprocess.run(cmd2, capture_output=True)
     # logger.info(' '.join(cmd2))
     with open(osp.join(log_path, "output.txt"), "a") as f:
         f.write(colmap_res.stdout.decode())
+    return True
 
 def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
          colmap_configs: Dict[str, Any],
@@ -204,14 +207,14 @@ def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
         camera_mode = pycolmap.CameraMode.PER_IMAGE
     elif colmap_configs["ImageReader_camera_mode"] == 'single_camera':
         camera_mode = pycolmap.CameraMode.SINGLE
-    
+
     camera_model = "SIMPLE_RADIAL" if 'ImageReader_camera_model' not in colmap_configs else colmap_configs['ImageReader_camera_model']
     if colmap_configs['use_pba']:
         camera_model = "SIMPLE_RADIAL"
 
     img_import_opts = pycolmap.ImageReaderOptions(camera_model=camera_model)
     import_images(image_dir, database, camera_mode, image_list, img_import_opts)
-    
+
     if prior_intrin is not None:
         logger.info(f"Load prior intrin into db...")
         if colmap_configs['use_pba']:
