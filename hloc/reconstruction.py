@@ -50,7 +50,7 @@ def get_image_ids(database_path: Path) -> Dict[str, int]:
     db.close()
     return images
 
-def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs=None, verbose=False):
+def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs):
     models_path = sfm_dir / 'models'
 
     models_path.mkdir(exist_ok=True, parents=True)
@@ -233,7 +233,7 @@ def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
         max_error = 4.0 if 'geometry_verify_thr' not in colmap_configs else colmap_configs['geometry_verify_thr']
         estimation_and_geometric_verification(database, pairs, verbose, max_error=max_error)
 
-    reconstruction = run_reconstruction(sfm_dir, database, image_dir, colmap_configs=colmap_configs, verbose=verbose)
+    reconstruction = run_reconstruction(sfm_dir, database, image_dir, colmap_configs=colmap_configs)
     if reconstruction is not None and verbose:
         logger.info(f'Reconstruction statistics:\n{reconstruction.summary()}'
                     + f'\n\tnum_input_images = {len(image_ids)}')
