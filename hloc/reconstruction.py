@@ -50,13 +50,22 @@ def get_image_ids(database_path: Path) -> Dict[str, int]:
     db.close()
     return images
 
-def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs=None, verbose=False):
+def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs):
     models_path = sfm_dir / 'models'
 
     models_path.mkdir(exist_ok=True, parents=True)
     if colmap_configs['colmap_mapper_cfgs'] is None:
         logger.info(f"Use PyCOLMAP for reconstruction...")
-        mapper_options = pycolmap.IncrementalMapperOptions(ba_global_use_pba=colmap_configs['use_pba'], ba_refine_focal_length=not colmap_configs['no_refine_intrinsics'], ba_refine_extra_params=not colmap_configs['no_refine_intrinsics'], num_threads=min(multiprocessing.cpu_count(), colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16))
+        if colmap_configs["use_pba"]:
+            mapper_options = pycolmap.IncrementalMapperOptions(ba_global_use_pba=colmap_configs['use_pba'], ba_refine_focal_length=not colmap_configs['no_refine_intrinsics'], ba_refine_extra_params=not colmap_configs['no_refine_intrinsics'], num_threads=min(multiprocessing.cpu_count(), colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16))
+        else:
+            mapper_options = pycolmap.IncrementalMapperOptions(ba_refine_focal_length=not colmap_configs['no_refine_intrinsics'],
+                                                               ba_refine_extra_params=not colmap_configs['no_refine_intrinsics'],
+                                                               ba_refine_principal_point=not colmap_configs['no_refine_intrinsics'],
+                                                               sphere_camera=colmap_configs['ImageReader_camera_model'] == 'SPHERE',
+                                                               num_threads=min(multiprocessing.cpu_count(),
+                                                                               colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16)
+            )
         logger.info('Running 3D reconstruction...')
         with OutputCapture(verbose):
             with pycolmap.ostream():
@@ -78,11 +87,14 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs=None, v
         if colmap_configs['use_pba']:
             cmd += ["--Mapper.ba_global_use_pba", '1']
 
+        if colmap_configs["ImageReader_camera_model"] == 'SPHERE':
+            cmd += ["--Mapper.sphere_camera", '1']
+
         if colmap_configs['colmap_mapper_cfgs'] is not None:
             for config_name, value in colmap_configs["colmap_mapper_cfgs"].items():
                 if config_name in NOT_EXPO_COLMAP_CFGS:
                     cmd += [NOT_EXPO_COLMAP_CFGS[config_name], str(value)]
-        
+
         if (
             colmap_configs is not None
             and colmap_configs["no_refine_intrinsics"] is True
@@ -94,13 +106,10 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs=None, v
                 "0",
             ]
 
-        if verbose:
-            logger.info(' '.join(cmd))
-            colmap_res = subprocess.run(cmd)
-        else:
-            colmap_res = subprocess.run(cmd, capture_output=True)
-            with open(osp.join(models_path, "output.txt"), "w") as f:
-                f.write(colmap_res.stdout.decode())
+        logger.info(' '.join(cmd))
+        colmap_res = subprocess.run(cmd, capture_output=True)
+        with open(osp.join(models_path, "output.txt"), "w") as f:
+            f.write(colmap_res.stdout.decode())
 
         reconstructions = {}
         for id, model_path in enumerate(sorted(models_path.glob('*'))):
@@ -112,7 +121,7 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs=None, v
         os.system(f"mv {models_path}/* {sfm_dir}")
         os.system(f"rm -rf {models_path}")
         return None
-    logger.info(f'Reconstructed {len(reconstructions)} model(s).') if verbose else None
+    logger.info(f'Reconstructed {len(reconstructions)} model(s).')
 
     largest_index = None
     largest_num_images = 0
@@ -122,19 +131,70 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs=None, v
             largest_index = index
             largest_num_images = num_images
     assert largest_index is not None
-    logger.info(f'Largest model is #{largest_index} '
-                f'with {largest_num_images} images.') if verbose else None
+
+
+    sorted_models = sorted(reconstructions.items(), key=lambda x: x[1].num_reg_images(), reverse=True)
+    logger.info(f"Models sorted by number of registered images: {sorted_models[0][0]} with {sorted_models[0][1].num_reg_images()} images.")
+    logger.info(f"model sizes {[(f'{idx}: {rec.num_reg_images()}') for idx, rec in sorted_models]}")
+    delete_models = []
+    for k in reversed(range(1, len(sorted_models))):
+        small_idx, _ = sorted_models[k]
+        small_rec = pycolmap.Reconstruction(models_path/str(small_idx))
+
+        for i in reversed(range(0, k)):
+            big_idx, _ = sorted_models[i]
+            big_rec = pycolmap.Reconstruction(models_path/str(big_idx))
+
+            common_images = big_rec.find_common_reg_image_ids(small_rec)
+            logger.info(f'Model #{big_idx} and #{small_idx} have {len(common_images)} common images.')
+            if len(common_images) > 2:
+                if merge_reconstruction(models_path/str(big_idx), models_path/str(small_idx), models_path/str(big_idx), models_path):
+                    delete_models.append(small_idx)
+
+            # logger.info(f'Model #{index} has {rec.num_reg_images()} images.')
+    for idx in delete_models:
+        os.system(f"rm -rf {models_path}/{idx}")
+        logger.info(f"Deleted model #{idx}.")
+    logger.info("Merge reconstruction models with common images...")
+    logger.info(f"省略できたモデル: {delete_models}")
+    logger.info(f"biggest new model:{sorted_models[0][0]} images: {pycolmap.Reconstruction(models_path/str(sorted_models[0][0])).num_reg_images()}")
 
     os.system(f"mv {models_path}/* {sfm_dir}")
     os.system(f"rm -rf {models_path}")
     return reconstructions[largest_index]
 
 
+def merge_reconstruction(input_path1, input_path2, output_path, log_path):
+    cmd = [COLMAP_PATH, "model_merger"]
+    cmd += ["--input_path1", str(input_path1)]
+    cmd += ["--input_path2", str(input_path2)]
+    cmd += ["--output_path", str(output_path)]
+
+    cmd2 = [COLMAP_PATH, "bundle_adjuster"]
+    cmd2 += ["--input_path", str(output_path)]
+    cmd2 += ["--output_path", str(output_path)]
+
+    colmap_res = subprocess.run(cmd, capture_output=True)
+    # logger.info(' '.join(cmd))
+    merge_output = colmap_res.stdout.decode()
+    with open(osp.join(log_path, "output.txt"), "a") as f:
+        f.write(merge_output)
+
+    if "Merge failed" in merge_output:
+        logger.error(f"Merge failed: {merge_output}")
+        return False
+    colmap_res = subprocess.run(cmd2, capture_output=True)
+    # logger.info(' '.join(cmd2))
+    with open(osp.join(log_path, "output.txt"), "a") as f:
+        f.write(colmap_res.stdout.decode())
+    return True
+
 def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
+         colmap_configs: Dict[str, Any],
          camera_mode=pycolmap.CameraMode.AUTO, verbose=False,
          skip_geometric_verification=False, min_match_score=None,
-         image_list: Optional[List[str]] = None, colmap_configs = None):
-
+         image_list: Optional[List[str]] = None,
+    ):
     assert features.exists(), features
     assert pairs.exists(), pairs
     assert matches.exists(), matches
@@ -147,14 +207,14 @@ def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
         camera_mode = pycolmap.CameraMode.PER_IMAGE
     elif colmap_configs["ImageReader_camera_mode"] == 'single_camera':
         camera_mode = pycolmap.CameraMode.SINGLE
-    
+
     camera_model = "SIMPLE_RADIAL" if 'ImageReader_camera_model' not in colmap_configs else colmap_configs['ImageReader_camera_model']
     if colmap_configs['use_pba']:
         camera_model = "SIMPLE_RADIAL"
 
     img_import_opts = pycolmap.ImageReaderOptions(camera_model=camera_model)
     import_images(image_dir, database, camera_mode, image_list, img_import_opts)
-    
+
     if prior_intrin is not None:
         logger.info(f"Load prior intrin into db...")
         if colmap_configs['use_pba']:
@@ -173,7 +233,7 @@ def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
         max_error = 4.0 if 'geometry_verify_thr' not in colmap_configs else colmap_configs['geometry_verify_thr']
         estimation_and_geometric_verification(database, pairs, verbose, max_error=max_error)
 
-    reconstruction = run_reconstruction(sfm_dir, database, image_dir, colmap_configs=colmap_configs, verbose=verbose)
+    reconstruction = run_reconstruction(sfm_dir, database, image_dir, colmap_configs=colmap_configs)
     if reconstruction is not None and verbose:
         logger.info(f'Reconstruction statistics:\n{reconstruction.summary()}'
                     + f'\n\tnum_input_images = {len(image_ids)}')
