@@ -6,7 +6,7 @@ import subprocess
 import os
 import os.path as osp
 
-from src.sfm_runner.utils.make_database import load_intrin_to_database
+from detectorfreesfm.sfm_runner.utils.make_database import load_intrin_to_database
 from . import logger
 from .utils.database import COLMAPDatabase
 from .triangulation import (
