@@ -115,7 +115,7 @@ def import_matches(image_ids, database_path, pairs_path, matches_path,
 
             # matches, scores = get_matches(matches_path, name0, name1) # This maybe slow due to constantly open file
             pair = ' '.join([name0, name1])
-            matches = hfile[pair].__array__().T
+            matches = hfile[pair.replace('/', '+')].__array__().T
             scores = np.ones((matches.shape[0],))
 
             if min_match_score:
@@ -134,11 +134,12 @@ def estimation_and_geometric_verification(database_path, pairs_path,
                                           verbose=False, max_error=4.0):
     logger.info('Performing geometric verification of the matches...')
     if max_error == 4.0:
+        raise NotImplementedError("max_error = 4.0 is not supported for 360 camera and perspective camera")
         # by default, max_error = 4.0. However, this parameter is not exposured by pycolmap.
         # If want to change this param, we have to use COLMAP command line.
         with OutputCapture(verbose):
             with pycolmap.ostream():
-                pycolmap.verify_matches(
+                pycolmap.verify_matches( # TODO check compatibility for 360 camera and perspective camera
                     database_path, pairs_path,
                     max_num_trials=20000, min_inlier_ratio=0.1)
     else:

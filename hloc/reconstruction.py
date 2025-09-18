@@ -26,12 +26,13 @@ def create_empty_db(database_path: Path):
     db.close()
 
 
-def setup_two_camera_database(image_dir: Path,
+def setup_two_camera_database(
                              database_path: Path,
                              camera_mode: pycolmap.CameraMode,
-                             image_list: Optional[List[str]] = None,
+                             image_list: List[str],
                              options: Optional[Dict[str, Any]] = None,
-                             colmap_configs: Optional[Dict[str, Any]] = None):
+                             colmap_configs: Optional[Dict[str, Any]] = None,
+                             rig_mode: bool = True):
     """
     2つのカメラ（iPhone: PINHOLE, Sphere: SPHERE）の事前知識をデータベースに組み込む
     カメラIDも事前に固定する
@@ -40,16 +41,22 @@ def setup_two_camera_database(image_dir: Path,
     if options is None:
         options = {}
     
-    images = list(image_dir.iterdir())
-    if len(images) == 0:
-        raise IOError(f'No images found in {image_dir}.')
+    images = [Path(img) for img in image_list]
     
     # 画像をカメラタイプ別に分類
     perspective_images = []
     sphere_images = []
     
-    for img_path in images:
-        if img_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.tiff', '.tif']:
+    if rig_mode:
+        image_dir = images[0].parent.parent
+        for img_path in images:
+            if 'iphone' in img_path.parent.name:
+                perspective_images.append(os.path.join(img_path.parent.name, img_path.name))
+            else:
+                sphere_images.append(os.path.join(img_path.parent.name, img_path.name))
+    else:
+        image_dir = images[0].parent
+        for img_path in images:
             img_name = img_path.name.lower()
             if 'iphone' in img_name:
                 perspective_images.append(img_path.name)
@@ -145,23 +152,20 @@ def setup_two_camera_database(image_dir: Path,
     db.close()
 
 
-def import_images_with_camera_detection(image_dir: Path,
+def import_images_with_camera_detection(
                                        database_path: Path,
                                        camera_mode: pycolmap.CameraMode,
-                                       image_list: Optional[List[str]] = None,
-                                       options: Optional[Dict[str, Any]] = None):
+                                       image_list: List[str]):
     """
     ファイル名に基づいてカメラタイプを判別し、適切なカメラモデルで画像をインポート
     - ファイル名に'iphone'が含まれる → perspective (PINHOLE)
     - それ以外 → sphere (SPHERE)
     """
     logger.info(f'Importing images with camera detection, camera mode is {camera_mode}...')
-    if options is None:
-        options = {}
     
-    images = list(image_dir.iterdir())
+    images = image_list
     if len(images) == 0:
-        raise IOError(f'No images found in {image_dir}.')
+        raise IOError(f'No images found in {image_list}.')
     
     # 画像をカメラタイプ別に分類
     perspective_images = []
@@ -182,7 +186,7 @@ def import_images_with_camera_detection(image_dir: Path,
         logger.info('Using PER_IMAGE mode - importing all images without specific camera model...')
         all_images = [img.name for img in images if img.suffix.lower() in ['.jpg', '.jpeg', '.png', '.tiff', '.tif']]
         with pycolmap.ostream():
-            pycolmap.import_images(database_path, image_dir, camera_mode,
+            pycolmap.import_images(database_path, str(Path(image_list[0]).parent), camera_mode,
                                    image_list=all_images,
                                    options=pycolmap.ImageReaderOptions())
     else:
@@ -194,7 +198,7 @@ def import_images_with_camera_detection(image_dir: Path,
             logger.info('Importing perspective images with PINHOLE camera model...')
             perspective_opts = pycolmap.ImageReaderOptions(camera_model="PINHOLE")
             with pycolmap.ostream():
-                pycolmap.import_images(database_path, image_dir, camera_mode,
+                pycolmap.import_images(database_path, perspective_images[0].parent, camera_mode,
                                        image_list=perspective_images,
                                        options=perspective_opts)
         
@@ -203,7 +207,7 @@ def import_images_with_camera_detection(image_dir: Path,
             logger.info('Importing sphere images with SPHERE camera model...')
             sphere_opts = pycolmap.ImageReaderOptions(camera_model="SPHERE")
             with pycolmap.ostream():
-                pycolmap.import_images(database_path, image_dir, camera_mode,
+                pycolmap.import_images(database_path, sphere_images[0].parent, camera_mode,
                                        image_list=sphere_images,
                                        options=sphere_opts)
         
@@ -396,10 +400,10 @@ def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
     # カメラ設定方法を選択
     if colmap_configs.get('use_two_camera_prior', False):
         # 2つのカメラの事前知識を使用
-        setup_two_camera_database(image_dir, database, camera_mode, image_list, None, colmap_configs)
+        setup_two_camera_database(database, camera_mode, image_list, colmap_configs)
     elif colmap_configs.get('use_filename_camera_detection', False):
         # ファイル名に基づいてカメラタイプを判別し、適切なカメラモデルでインポート
-        import_images_with_camera_detection(image_dir, database, camera_mode, image_list)
+        import_images_with_camera_detection(database, camera_mode, image_list)
     else:
         # 従来の方法
         if camera_mode == pycolmap.CameraMode.PER_IMAGE:

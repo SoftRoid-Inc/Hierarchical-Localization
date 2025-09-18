@@ -30,7 +30,7 @@ def list_h5_names(path):
 def get_keypoints(path: Path, name: str,
                   return_uncertainty: bool = False) -> np.ndarray:
     with h5py.File(str(path), 'r') as hfile:
-        dset = hfile[name]
+        dset = hfile[name.replace('/', '+')]
         p = dset.__array__()
     if return_uncertainty:
         return p, None
