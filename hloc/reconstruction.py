@@ -7,7 +7,7 @@ import os
 import os.path as osp
 
 from detectorfreesfm.sfm_runner.utils.make_database import load_intrin_to_database
-from . import logger
+from loguru import logger
 from .utils.database import COLMAPDatabase
 from .triangulation import (
     import_features, import_matches, estimation_and_geometric_verification,
