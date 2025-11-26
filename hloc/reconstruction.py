@@ -37,7 +37,7 @@ def import_images(image_dir: Path,
     if len(images) == 0:
         raise IOError(f'No images found in {image_dir}.')
     with pycolmap.ostream():
-        pycolmap.import_images(database_path, image_dir, camera_mode,
+        pycolmap.import_images(str(database_path), str(image_dir), camera_mode,
                                image_list=image_list or [],
                                options=options)
 
@@ -226,9 +226,9 @@ def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
         load_intrin_to_database(database, prior_intrin, colmap_configs)
 
     image_ids = get_image_ids(database)
-    import_features(image_ids, database, features, verbose=verbose)
+    import_features(image_ids, database, features, verbose=verbose, replace_slash=True)
     import_matches(image_ids, database, pairs, matches,
-                   min_match_score, skip_geometric_verification, verbose=verbose)
+                   min_match_score, skip_geometric_verification, verbose=verbose, replace_slash=True)
     if not skip_geometric_verification:
         max_error = 4.0 if 'geometry_verify_thr' not in colmap_configs else colmap_configs['geometry_verify_thr']
         estimation_and_geometric_verification(database, pairs, verbose, max_error=max_error)

@@ -82,12 +82,17 @@ def create_db_from_model(reconstruction: pycolmap.Reconstruction,
     return {image.name: i for i, image in reconstruction.images.items()}
 
 
-def import_features(image_ids, database_path, features_path, verbose):
+def import_features(image_ids, database_path, features_path, verbose, replace_slash=False):
     logger.info('Importing features into the database...')
     db = COLMAPDatabase.connect(database_path)
 
     for image_name, image_id in tqdm(image_ids.items(), disable=not verbose):
-        keypoints = get_keypoints(features_path, image_name)
+        try:
+            key_name = image_name.replace('/', '+') if replace_slash else image_name
+            keypoints = get_keypoints(features_path, key_name)
+        except Exception as e:
+            logger.error(f'Error loading keypoints for image {image_name}: {e}')
+            raise e
         keypoints += 0.5  # COLMAP origin
         db.add_keypoints(image_id, keypoints)
 
@@ -96,7 +101,7 @@ def import_features(image_ids, database_path, features_path, verbose):
 
 
 def import_matches(image_ids, database_path, pairs_path, matches_path,
-                   min_match_score=None, skip_geometric_verification=False, verbose=True):
+                   min_match_score=None, skip_geometric_verification=False, verbose=True,replace_slash=False):
     logger.info('Importing matches into the database...')
 
     with open(str(pairs_path), 'r') as f:
@@ -108,12 +113,13 @@ def import_matches(image_ids, database_path, pairs_path, matches_path,
 
     with h5py.File(str(matches_path), 'r', libver='latest') as hfile:
         for name0, name1 in tqdm(pairs, disable=not verbose):
-
             id0, id1 = image_ids[name0], image_ids[name1]
             if len({(id0, id1), (id1, id0)} & matched) > 0:
                 continue
 
             # matches, scores = get_matches(matches_path, name0, name1) # This maybe slow due to constantly open file
+            name0 = name0.replace('/', '+') if replace_slash else name0
+            name1 = name1.replace('/', '+') if replace_slash else name1
             pair = ' '.join([name0, name1])
             matches = hfile[pair].__array__().T
             scores = np.ones((matches.shape[0],))
