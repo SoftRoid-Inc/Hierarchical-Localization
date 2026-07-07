@@ -11,8 +11,7 @@ from loguru import logger
 from .utils.database import COLMAPDatabase
 from .triangulation import (
     import_features, import_matches, estimation_and_geometric_verification,
-    OutputCapture, NOT_EXPO_COLMAP_CFGS)
-COLMAP_PATH = os.environ.get("COLMAP_PATH", 'colmap') # 'colmap is default value
+    OutputCapture, NOT_EXPO_COLMAP_CFGS, COLMAP_PATH)
 
 def create_empty_db(database_path: Path):
     if database_path.exists():
@@ -38,7 +37,7 @@ def import_images(image_dir: Path,
         raise IOError(f'No images found in {image_dir}.')
     with pycolmap.ostream():
         pycolmap.import_images(str(database_path), str(image_dir), camera_mode,
-                               image_list=image_list or [],
+                               image_names=image_list or [],
                                options=options)
 
 
@@ -50,22 +49,20 @@ def get_image_ids(database_path: Path) -> Dict[str, int]:
     db.close()
     return images
 
-def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs):
+def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs, verbose=False):
     models_path = sfm_dir / 'models'
 
     models_path.mkdir(exist_ok=True, parents=True)
     if colmap_configs['colmap_mapper_cfgs'] is None:
         logger.info(f"Use PyCOLMAP for reconstruction...")
         if colmap_configs["use_pba"]:
-            mapper_options = pycolmap.IncrementalMapperOptions(ba_global_use_pba=colmap_configs['use_pba'], ba_refine_focal_length=not colmap_configs['no_refine_intrinsics'], ba_refine_extra_params=not colmap_configs['no_refine_intrinsics'], num_threads=min(multiprocessing.cpu_count(), colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16))
-        else:
-            mapper_options = pycolmap.IncrementalMapperOptions(ba_refine_focal_length=not colmap_configs['no_refine_intrinsics'],
-                                                               ba_refine_extra_params=not colmap_configs['no_refine_intrinsics'],
-                                                               ba_refine_principal_point=not colmap_configs['no_refine_intrinsics'],
-                                                               sphere_camera=colmap_configs['ImageReader_camera_model'] == 'SPHERE',
-                                                               num_threads=min(multiprocessing.cpu_count(),
-                                                                               colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16)
-            )
+            logger.warning("PBA is not supported in stock pycolmap 4.1.0 IncrementalPipelineOptions; ignoring use_pba on the pycolmap path.")
+        mapper_options = pycolmap.IncrementalPipelineOptions(ba_refine_focal_length=not colmap_configs['no_refine_intrinsics'],
+                                                           ba_refine_extra_params=not colmap_configs['no_refine_intrinsics'],
+                                                           ba_refine_principal_point=not colmap_configs['no_refine_intrinsics'],
+                                                           num_threads=min(multiprocessing.cpu_count(),
+                                                                           colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16)
+        )
         logger.info('Running 3D reconstruction...')
         with OutputCapture(verbose):
             with pycolmap.ostream():
@@ -85,10 +82,7 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs):
         cmd += ["--Mapper.num_threads", str(min(multiprocessing.cpu_count(), colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16))]
 
         if colmap_configs['use_pba']:
-            cmd += ["--Mapper.ba_global_use_pba", '1']
-
-        if colmap_configs["ImageReader_camera_model"] == 'SPHERE':
-            cmd += ["--Mapper.sphere_camera", '1']
+            logger.warning("PBA (--Mapper.ba_global_use_pba) is not supported by stock COLMAP 4.1.0; ignoring use_pba.")
 
         if colmap_configs['colmap_mapper_cfgs'] is not None:
             for config_name, value in colmap_configs["colmap_mapper_cfgs"].items():
@@ -110,6 +104,10 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs):
         colmap_res = subprocess.run(cmd, capture_output=True)
         with open(osp.join(models_path, "output.txt"), "w") as f:
             f.write(colmap_res.stdout.decode())
+            f.write(colmap_res.stderr.decode())
+        if colmap_res.returncode != 0:
+            logger.error(f"COLMAP mapper failed with exit code {colmap_res.returncode}:\n"
+                         f"{colmap_res.stderr.decode()}")
 
         reconstructions = {}
         for id, model_path in enumerate(sorted(models_path.glob('*'))):
