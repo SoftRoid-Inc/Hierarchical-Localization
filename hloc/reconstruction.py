@@ -49,11 +49,48 @@ def get_image_ids(database_path: Path) -> Dict[str, int]:
     db.close()
     return images
 
+def _prior_mapper_options(colmap_configs):
+    """位置プライア付きマッピング用の IncrementalPipelineOptions を構築する。
+
+    プライア有効時は CLI 設定の有無に関わらず pycolmap パスを使う
+    （CLI の mapper は pose_priors を読まないため）。colmap_mapper_cfgs の
+    チューニング値は setattr で opts.mapper へ引き継ぐ。
+    """
+    opts = pycolmap.IncrementalPipelineOptions(
+        ba_refine_focal_length=not colmap_configs['no_refine_intrinsics'],
+        ba_refine_extra_params=not colmap_configs['no_refine_intrinsics'],
+        ba_refine_principal_point=not colmap_configs['no_refine_intrinsics'],
+        num_threads=min(multiprocessing.cpu_count(),
+                        colmap_configs.get('n_threads', 16)))
+    opts.use_prior_position = True
+    opts.use_robust_loss_on_prior_position = True
+    if 'min_model_size' in colmap_configs:
+        opts.min_model_size = colmap_configs['min_model_size']
+    for key, value in (colmap_configs.get('colmap_mapper_cfgs') or {}).items():
+        target = opts.mapper if hasattr(opts.mapper, key) else (
+            opts if hasattr(opts, key) else None)
+        if target is None:
+            logger.warning(f"colmap_mapper_cfgs.{key} は pycolmap の "
+                           "IncrementalPipelineOptions に無いため無視します")
+            continue
+        setattr(target, key, value)
+    return opts
+
+
 def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs, verbose=False):
     models_path = sfm_dir / 'models'
 
     models_path.mkdir(exist_ok=True, parents=True)
-    if colmap_configs['colmap_mapper_cfgs'] is None:
+    if colmap_configs.get('use_prior_position'):
+        logger.info("Use PyCOLMAP with pose priors for reconstruction...")
+        mapper_options = _prior_mapper_options(colmap_configs)
+        with OutputCapture(verbose):
+            with pycolmap.ostream():
+                logger.info(mapper_options.summary())
+                reconstructions = pycolmap.incremental_mapping(
+                    database_path, image_dir, models_path,
+                    mapper_options,)
+    elif colmap_configs['colmap_mapper_cfgs'] is None:
         logger.info(f"Use PyCOLMAP for reconstruction...")
         if colmap_configs["use_pba"]:
             logger.warning("PBA is not supported in stock pycolmap 4.1.0 IncrementalPipelineOptions; ignoring use_pba on the pycolmap path.")
@@ -192,6 +229,7 @@ def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
          camera_mode=pycolmap.CameraMode.AUTO, verbose=False,
          skip_geometric_verification=False, min_match_score=None,
          image_list: Optional[List[str]] = None,
+         prior_pose_path=None,
     ):
     assert features.exists(), features
     assert pairs.exists(), pairs
@@ -230,6 +268,16 @@ def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
     if not skip_geometric_verification:
         max_error = 4.0 if 'geometry_verify_thr' not in colmap_configs else colmap_configs['geometry_verify_thr']
         estimation_and_geometric_verification(database, pairs, verbose, max_error=max_error)
+
+    if prior_pose_path is not None:
+        from .utils.pose_priors import inject_pose_priors_from_csv
+        sigma = colmap_configs.get('prior_position_std_m') or 3.0
+        n_prior, n_skip = inject_pose_priors_from_csv(
+            database, prior_pose_path, sigma=sigma)
+        logger.info(f"pose_priors 注入: {n_prior} 件 "
+                    f"(対応無し {n_skip} 件, σ={sigma} m)")
+        # 1 件も注入できなければ従来マッパーへフォールバック
+        colmap_configs['use_prior_position'] = n_prior > 0
 
     reconstruction = run_reconstruction(sfm_dir, database, image_dir, colmap_configs=colmap_configs)
     if reconstruction is not None and verbose:
