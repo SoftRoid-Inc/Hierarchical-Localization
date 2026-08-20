@@ -242,6 +242,7 @@ def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
          camera_mode=pycolmap.CameraMode.AUTO, verbose=False,
          skip_geometric_verification=False, min_match_score=None,
          image_list: Optional[List[str]] = None,
+         prior_pose_path=None,
     ):
     assert features.exists(), features
     assert pairs.exists(), pairs
@@ -280,6 +281,16 @@ def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
     if not skip_geometric_verification:
         max_error = 4.0 if 'geometry_verify_thr' not in colmap_configs else colmap_configs['geometry_verify_thr']
         estimation_and_geometric_verification(database, pairs, verbose, max_error=max_error)
+
+    if prior_pose_path is not None:
+        from .utils.pose_priors import inject_pose_priors_from_csv
+        sigma = colmap_configs.get('prior_position_std_m') or 3.0
+        n_prior, n_skip = inject_pose_priors_from_csv(
+            database, prior_pose_path, sigma=sigma)
+        logger.info(f"pose_priors 注入: {n_prior} 件 "
+                    f"(対応無し {n_skip} 件, σ={sigma} m)")
+        # 1 件も注入できなければ従来マッパーへフォールバック
+        colmap_configs['use_prior_position'] = n_prior > 0
 
     reconstruction = run_reconstruction(sfm_dir, database, image_dir, colmap_configs=colmap_configs)
     if reconstruction is not None and verbose:
