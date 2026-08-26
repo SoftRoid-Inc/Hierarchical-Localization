@@ -49,24 +49,74 @@ def get_image_ids(database_path: Path) -> Dict[str, int]:
     db.close()
     return images
 
+def _num_mapper_threads(colmap_configs):
+    return min(multiprocessing.cpu_count(),
+               colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16)
+
+
+def run_global_mapper(database_path, image_dir, models_path, colmap_configs):
+    """Run COLMAP 4.x `global_mapper` (integrated GLOMAP) and return reconstructions."""
+    cmd = [COLMAP_PATH, "global_mapper"]
+    cmd += ["--image_path", str(image_dir)]
+    cmd += ["--database_path", str(database_path)]
+    cmd += ["--output_path", str(models_path)]
+    cmd += ["--GlobalMapper.num_threads", str(_num_mapper_threads(colmap_configs))]
+
+    if colmap_configs is not None and colmap_configs.get("no_refine_intrinsics") is True:
+        cmd += [
+            "--GlobalMapper.ba_refine_focal_length", "0",
+            "--GlobalMapper.ba_refine_extra_params", "0",
+        ]
+
+    logger.info(' '.join(cmd))
+    colmap_res = subprocess.run(cmd, capture_output=True)
+
+    # global_mapper may write the model directly into output_path instead of a
+    # numbered sub-directory; normalize to the models_path/<id>/ layout expected below.
+    if (models_path / 'cameras.bin').exists() or (models_path / 'cameras.txt').exists():
+        model_dir = models_path / '0'
+        model_dir.mkdir(exist_ok=True)
+        for name in ('cameras', 'images', 'points3D', 'rigs', 'frames'):
+            for ext in ('.bin', '.txt'):
+                src = models_path / f"{name}{ext}"
+                if src.exists():
+                    src.rename(model_dir / src.name)
+
+    with open(osp.join(models_path, "output.txt"), "w") as f:
+        f.write(colmap_res.stdout.decode())
+        f.write(colmap_res.stderr.decode())
+    if colmap_res.returncode != 0:
+        logger.error(f"COLMAP global_mapper failed with exit code {colmap_res.returncode}:\n"
+                     f"{colmap_res.stderr.decode()}")
+
+    reconstructions = {}
+    for id, model_path in enumerate(sorted(models_path.glob('*'))):
+        if model_path.is_dir():
+            reconstructions[id] = pycolmap.Reconstruction(model_path)
+    return reconstructions
+
+
 def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs, verbose=False):
     models_path = sfm_dir / 'models'
 
     models_path.mkdir(exist_ok=True, parents=True)
-    if colmap_configs['colmap_mapper_cfgs'] is None:
+    mapper_type = colmap_configs.get('mapper_type', 'colmap') if colmap_configs else 'colmap'
+    if mapper_type == 'glomap':
+        logger.info("Use COLMAP global_mapper (GLOMAP) for reconstruction...")
+        reconstructions = run_global_mapper(database_path, image_dir, models_path, colmap_configs)
+    elif colmap_configs['colmap_mapper_cfgs'] is None:
         logger.info(f"Use PyCOLMAP for reconstruction...")
         if colmap_configs["use_pba"]:
             logger.warning("PBA is not supported in stock pycolmap 4.1.0 IncrementalPipelineOptions; ignoring use_pba on the pycolmap path.")
         mapper_options = pycolmap.IncrementalPipelineOptions(ba_refine_focal_length=not colmap_configs['no_refine_intrinsics'],
                                                            ba_refine_extra_params=not colmap_configs['no_refine_intrinsics'],
                                                            ba_refine_principal_point=not colmap_configs['no_refine_intrinsics'],
-                                                           num_threads=min(multiprocessing.cpu_count(),
-                                                                           colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16)
+                                                           num_threads=_num_mapper_threads(colmap_configs)
         )
         logger.info('Running 3D reconstruction...')
         with OutputCapture(verbose):
             with pycolmap.ostream():
-                logger.info(f"use: {min(multiprocessing.cpu_count(), colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16)} cpus")
+                logger.info(f"use: {_num_mapper_threads(colmap_configs)} cpus")
                 logger.info(mapper_options.summary())
                 reconstructions = pycolmap.incremental_mapping(
                     database_path, image_dir, models_path,
@@ -79,7 +129,7 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs, verbos
         cmd += ["--output_path", str(models_path)]
         if colmap_configs is not None and "min_model_size" in colmap_configs:
             cmd += ["--Mapper.min_model_size", str(colmap_configs["min_model_size"])]
-        cmd += ["--Mapper.num_threads", str(min(multiprocessing.cpu_count(), colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16))]
+        cmd += ["--Mapper.num_threads", str(_num_mapper_threads(colmap_configs))]
 
         if colmap_configs['use_pba']:
             logger.warning("PBA (--Mapper.ba_global_use_pba) is not supported by stock COLMAP 4.1.0; ignoring use_pba.")
