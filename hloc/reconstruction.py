@@ -121,6 +121,16 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs, verbos
         if colmap_configs['use_pba']:
             logger.warning("PBA (--Mapper.ba_global_use_pba) is not supported by stock COLMAP 4.1.0; ignoring use_pba.")
 
+        if colmap_configs.get('ba_backend') == 'CASPAR':
+            # GPU BA バックエンド（COLMAP を -DCASPAR_ENABLED=ON でビルドした
+            # 場合のみ有効）。CASPAR は glog の WARNING をフレーム毎に大量に
+            # 吐き /tmp のファイルログが GB 級になるため stderr のみへ抑制する
+            cmd += [
+                "--Mapper.ba_local_backend", "CASPAR",
+                "--Mapper.ba_global_backend", "CASPAR",
+                "--log_target", "stderr",
+            ]
+
         if colmap_configs['colmap_mapper_cfgs'] is not None:
             for config_name, value in colmap_configs["colmap_mapper_cfgs"].items():
                 if config_name in NOT_EXPO_COLMAP_CFGS:
