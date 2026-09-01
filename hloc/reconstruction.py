@@ -2,6 +2,7 @@ from typing import Optional, List, Dict, Any
 import multiprocessing
 from pathlib import Path
 import pycolmap
+import shutil
 import subprocess
 import os
 import os.path as osp
@@ -193,7 +194,7 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs, verbos
             common_images = big_rec.find_common_reg_image_ids(small_rec)
             logger.info(f'Model #{big_idx} and #{small_idx} have {len(common_images)} common images.')
             if len(common_images) > 2:
-                if merge_reconstruction(models_path/str(big_idx), models_path/str(small_idx), models_path/str(big_idx), models_path):
+                if merge_reconstruction(models_path/str(big_idx), models_path/str(small_idx), models_path/str(big_idx), models_path, colmap_configs):
                     delete_models.append(small_idx)
 
             # logger.info(f'Model #{index} has {rec.num_reg_images()} images.')
@@ -204,12 +205,97 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs, verbos
     logger.info(f"省略できたモデル: {delete_models}")
     logger.info(f"biggest new model:{sorted_models[0][0]} images: {pycolmap.Reconstruction(models_path/str(sorted_models[0][0])).num_reg_images()}")
 
+    if colmap_configs is not None and colmap_configs.get('enable_model_clustering'):
+        _cluster_and_refine_models(models_path, colmap_configs)
+
     os.system(f"mv {models_path}/* {sfm_dir}")
     os.system(f"rm -rf {models_path}")
     return reconstructions[largest_index]
 
 
-def merge_reconstruction(input_path1, input_path2, output_path, log_path):
+def _ba_backend_args(colmap_configs):
+    """bundle_adjuster 用のバックエンド引数。CASPAR は glog の WARNING を
+    /tmp にファイルとして大量に吐くため stderr のみへ抑制する（mapper と同様）。"""
+    if colmap_configs is not None and colmap_configs.get('ba_backend') == 'CASPAR':
+        return ["--BundleAdjustment.backend", "CASPAR", "--log_target", "stderr"]
+    return []
+
+
+def _run_colmap_logged(cmd, log_path):
+    res = subprocess.run(cmd, capture_output=True)
+    with open(osp.join(log_path, "output.txt"), "a") as f:
+        f.write(res.stdout.decode())
+        f.write(res.stderr.decode())
+    if res.returncode != 0:
+        logger.error(f"colmap command failed (rc={res.returncode}): {' '.join(map(str, cmd))}")
+    return res.returncode == 0
+
+
+def _cluster_and_refine_models(models_path, colmap_configs):
+    """マージ後のモデル群を共可視クラスタリングで検疫し、クラスターごとに再最適化する。
+
+    model_clusterer は「共有 3D 点数を辺重みとする共可視グラフ」を適応しきい値
+    （median - MAD）+ Union-Find で分割し、弱くしか繋がっていないフレーム塊
+    （誤マッチによる貼り合わせ・軌跡端の孤立区間）を独立モデルに切り出す。
+    小さすぎるクラスター（min_num_reg_frames 未満）のフレームは破棄される。
+
+    分割で観測が抜けた 3D 点が退化して残るため、point_filtering で除去してから
+    bundle_adjuster で縮小後の問題を最適化し直す。
+
+    処理後は全モデルディレクトリを 0..N-1 に連番リネームする。下流
+    （get_best_colmap_index / sfm_project の _colmap_to_pandas）は
+    「colmap_coarse 直下の全サブディレクトリ = int 名のモデル」を前提とするため、
+    余計なディレクトリを残してはならない。
+    """
+    cluster_tmp = models_path.parent / "cluster_tmp"
+    shutil.rmtree(cluster_tmp, ignore_errors=True)
+
+    final_models = []
+    for model_dir in sorted([d for d in models_path.iterdir() if d.is_dir()]):
+        out_dir = cluster_tmp / model_dir.name
+        out_dir.mkdir(parents=True)
+        cmd = [COLMAP_PATH, "model_clusterer"]
+        cmd += ["--input_path", str(model_dir)]
+        cmd += ["--output_path", str(out_dir)]
+        cmd += ["--ReconstructionClusterer.min_num_reg_frames",
+                str(colmap_configs.get('model_clustering_min_num_reg_frames', 3))]
+        ok = _run_colmap_logged(cmd, models_path)
+        clusters = sorted([d for d in out_dir.iterdir() if d.is_dir()]) if ok else []
+        if not clusters:
+            # クラスタリング失敗 / 全クラスターが最小フレーム数未満 → 元モデルを維持
+            logger.warning(f"model_clusterer produced no clusters for {model_dir.name}; keeping original model")
+            final_models.append(model_dir)
+            continue
+        if len(clusters) > 1:
+            logger.info(f"Model {model_dir.name} split into {len(clusters)} clusters")
+        shutil.rmtree(model_dir)
+        final_models.extend(clusters)
+
+    # 衝突しないよう一旦テンポラリー名に退避してから 0..N-1 に連番リネーム
+    staged = []
+    for i, src in enumerate(final_models):
+        dst = models_path / f"__staged_{i}"
+        shutil.move(str(src), str(dst))
+        staged.append(dst)
+    for i, src in enumerate(staged):
+        src.rename(models_path / str(i))
+    shutil.rmtree(cluster_tmp, ignore_errors=True)
+
+    ba_args = _ba_backend_args(colmap_configs)
+    for i in range(len(staged)):
+        model_dir = models_path / str(i)
+        _run_colmap_logged(
+            [COLMAP_PATH, "point_filtering",
+             "--input_path", str(model_dir), "--output_path", str(model_dir)],
+            models_path)
+        _run_colmap_logged(
+            [COLMAP_PATH, "bundle_adjuster",
+             "--input_path", str(model_dir), "--output_path", str(model_dir)] + ba_args,
+            models_path)
+    logger.info(f"Model clustering done: {len(staged)} final model(s)")
+
+
+def merge_reconstruction(input_path1, input_path2, output_path, log_path, colmap_configs=None):
     cmd = [COLMAP_PATH, "model_merger"]
     cmd += ["--input_path1", str(input_path1)]
     cmd += ["--input_path2", str(input_path2)]
@@ -218,6 +304,7 @@ def merge_reconstruction(input_path1, input_path2, output_path, log_path):
     cmd2 = [COLMAP_PATH, "bundle_adjuster"]
     cmd2 += ["--input_path", str(output_path)]
     cmd2 += ["--output_path", str(output_path)]
+    cmd2 += _ba_backend_args(colmap_configs)
 
     colmap_res = subprocess.run(cmd, capture_output=True)
     # logger.info(' '.join(cmd))
