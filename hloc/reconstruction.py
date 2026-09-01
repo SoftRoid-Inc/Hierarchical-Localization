@@ -250,8 +250,16 @@ def _cluster_and_refine_models(models_path, colmap_configs):
     cluster_tmp = models_path.parent / "cluster_tmp"
     shutil.rmtree(cluster_tmp, ignore_errors=True)
 
+    # model_clusterer / point_filtering / bundle_adjuster の出力は mapper と違い
+    # project.ini を書かないが、下流（init_sfm_run_cloud_data のモデル
+    # アップロード等）はモデル dir に project.ini がある前提。元モデルのものを
+    # 控えておき、最後に欠けている dir へ複製する
+    project_ini_bytes = None
+
     final_models = []
     for model_dir in sorted([d for d in models_path.iterdir() if d.is_dir()]):
+        if project_ini_bytes is None and (model_dir / "project.ini").exists():
+            project_ini_bytes = (model_dir / "project.ini").read_bytes()
         out_dir = cluster_tmp / model_dir.name
         out_dir.mkdir(parents=True)
         cmd = [COLMAP_PATH, "model_clusterer"]
@@ -278,7 +286,10 @@ def _cluster_and_refine_models(models_path, colmap_configs):
         shutil.move(str(src), str(dst))
         staged.append(dst)
     for i, src in enumerate(staged):
-        src.rename(models_path / str(i))
+        dst = models_path / str(i)
+        src.rename(dst)
+        if project_ini_bytes is not None and not (dst / "project.ini").exists():
+            (dst / "project.ini").write_bytes(project_ini_bytes)
     shutil.rmtree(cluster_tmp, ignore_errors=True)
 
     ba_args = _ba_backend_args(colmap_configs)
