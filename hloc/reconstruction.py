@@ -267,6 +267,8 @@ def _cluster_and_refine_models(models_path, colmap_configs):
         cmd += ["--output_path", str(out_dir)]
         cmd += ["--ReconstructionClusterer.min_num_reg_frames",
                 str(colmap_configs.get('model_clustering_min_num_reg_frames', 3))]
+        cmd += ["--ReconstructionClusterer.min_edge_weight_threshold",
+                str(colmap_configs.get('model_clustering_min_edge_weight', 10.0))]
         ok = _run_colmap_logged(cmd, models_path)
         clusters = sorted([d for d in out_dir.iterdir() if d.is_dir()]) if ok else []
         if not clusters:
