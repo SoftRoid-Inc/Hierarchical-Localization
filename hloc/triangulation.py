@@ -17,10 +17,12 @@ from .utils.io import get_keypoints, get_matches
 from .utils.parsers import parse_retrieval
 from .utils.geometry import compute_epipolar_errors
 
+COLMAP_PATH = os.environ.get("COLMAP_PATH", 'colmap')
+
 NOT_EXPO_COLMAP_CFGS = {
     "init_max_error": "--Mapper.init_max_error",
     "init_max_forward_motion": "--Mapper.init_max_forward_motion",
-    "init_max_req_trials": "--Mapper.init_max_req_trials",
+    "init_max_req_trials": "--Mapper.init_max_reg_trials",
 
     "abs_pose_max_error": "--Mapper.abs_pose_max_error",
     "abs_pose_min_num_inliers": "--Mapper.abs_pose_min_num_inliers",
@@ -32,7 +34,7 @@ NOT_EXPO_COLMAP_CFGS = {
     "tri_continue_max_angle_error": "--Mapper.tri_continue_max_angle_error",
     "tri_complete_max_reproj_error": "--Mapper.tri_complete_max_reproj_error",
 
-    'ba_global_images_ratio': "--Mapper.ba_global_images_ratio",
+    'ba_global_images_ratio': "--Mapper.ba_global_frames_ratio",  # COLMAP 4.x renamed images -> frames
     'ba_global_points_ratio': "--Mapper.ba_global_points_ratio",
     'ba_global_max_num_iterations': "--Mapper.ba_global_max_num_iterations",
     'ba_global_max_refinements' : "--Mapper.ba_global_max_refinements",
@@ -139,32 +141,13 @@ def import_matches(image_ids, database_path, pairs_path, matches_path,
 def estimation_and_geometric_verification(database_path, pairs_path,
                                           verbose=False, max_error=4.0):
     logger.info('Performing geometric verification of the matches...')
-    if max_error == 4.0:
-        # by default, max_error = 4.0. However, this parameter is not exposured by pycolmap.
-        # If want to change this param, we have to use COLMAP command line.
-        with OutputCapture(verbose):
-            with pycolmap.ostream():
-                pycolmap.verify_matches(
-                    database_path, pairs_path,
-                    max_num_trials=20000, min_inlier_ratio=0.1)
-    else:
-        print("COLMAP Match Import")
-        cmd = ["colmap", "matches_importer"]
-        cmd += ["--database_path", str(database_path)]
-        cmd += ["--match_list_path", str(pairs_path)]
-        cmd += ["--match_type", "pairs"]
-        cmd += ["--SiftMatching.max_num_trials", "20000"]
-        cmd += ["--SiftMatching.min_inlier_ratio", "0.1"]
-        cmd += ['--SiftMatching.max_error', f"{max_error}"]
-        cmd += ["--SiftMatching.use_gpu", "0"]
-
-        if verbose:
-            logger.info(' '.join(cmd))
-            colmap_res = subprocess.run(cmd)
-        else:
-            colmap_res = subprocess.run(cmd, capture_output=True)
-            with open(osp.join(osp.dirname(database_path), 'output.txt'), 'w') as f:
-                f.write(colmap_res.stdout.decode())
+    options = pycolmap.TwoViewGeometryOptions()
+    options.ransac.max_error = max_error
+    options.ransac.max_num_trials = 20000
+    options.ransac.min_inlier_ratio = 0.1
+    with OutputCapture(verbose):
+        with pycolmap.ostream():
+            pycolmap.verify_matches(database_path, pairs_path, options)
 
 
 
@@ -228,9 +211,8 @@ def run_triangulation(model_path, database_path, image_dir, reference_model, col
                       verbose=False):
     model_path.mkdir(parents=True, exist_ok=True)
     if colmap_configs["use_pba"]:
-        mapper_options = pycolmap.IncrementalMapperOptions(ba_global_use_pba=colmap_configs['use_pba'])
-    else:
-        mapper_options = pycolmap.IncrementalMapperOptions()
+        logger.warning("PBA is not supported in stock pycolmap 4.1.0 IncrementalPipelineOptions; ignoring use_pba.")
+    mapper_options = pycolmap.IncrementalPipelineOptions()
     logger.info('Running 3D triangulation...')
     with OutputCapture(verbose):
         with pycolmap.ostream():
@@ -245,7 +227,7 @@ def run_triangulation_cmd(model_path, database_path, image_dir, reference_model,
     logger.info('Running 3D triangulation...')
 
     cmd = [
-        "colmap", 'point_triangulator',
+        COLMAP_PATH, 'point_triangulator',
         '--database_path', str(database_path),
         '--image_path', str(image_dir),
         '--input_path', str(reference_model),
@@ -263,11 +245,17 @@ def run_triangulation_cmd(model_path, database_path, image_dir, reference_model,
     if verbose:
         logger.info(' '.join(cmd))
         ret = subprocess.call(cmd)
+        error_output = ''
     else:
         ret_all = subprocess.run(cmd, capture_output=True)
         with open(osp.join(model_path, 'output.txt'), 'w') as f:
             f.write(ret_all.stdout.decode())
+            f.write(ret_all.stderr.decode())
         ret = ret_all.returncode
+        error_output = ret_all.stderr.decode()
+    if ret != 0:
+        raise RuntimeError(
+            f"COLMAP point_triangulator failed with exit code {ret}: {error_output}")
 
     reconstruction = pycolmap.Reconstruction(model_path)
 
@@ -348,6 +336,6 @@ if __name__ == '__main__':
     args = parser.parse_args().__dict__
 
     mapper_options = parse_option_args(
-        args.pop("mapper_options"), pycolmap.IncrementalMapperOptions())
+        args.pop("mapper_options"), pycolmap.IncrementalPipelineOptions())
 
     main(**args, mapper_options=mapper_options)

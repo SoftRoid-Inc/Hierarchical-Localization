@@ -66,7 +66,13 @@ CAMERA_MODELS = {
     CameraModel(model_id=8, model_name="SIMPLE_RADIAL_FISHEYE", num_params=4),
     CameraModel(model_id=9, model_name="RADIAL_FISHEYE", num_params=5),
     CameraModel(model_id=10, model_name="THIN_PRISM_FISHEYE", num_params=12),
-    CameraModel(model_id=11, model_name="SPHERE", num_params=3)
+    CameraModel(model_id=11, model_name="RAD_TAN_THIN_PRISM_FISHEYE", num_params=16),
+    CameraModel(model_id=12, model_name="SIMPLE_DIVISION", num_params=4),
+    CameraModel(model_id=13, model_name="DIVISION", num_params=5),
+    CameraModel(model_id=14, model_name="SIMPLE_FISHEYE", num_params=4),
+    CameraModel(model_id=15, model_name="FISHEYE", num_params=5),
+    CameraModel(model_id=16, model_name="EUCM", num_params=6),
+    CameraModel(model_id=17, model_name="EQUIRECTANGULAR", num_params=2),
 }
 CAMERA_MODEL_IDS = dict([(camera_model.model_id, camera_model)
                          for camera_model in CAMERA_MODELS])
