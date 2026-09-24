@@ -9,6 +9,8 @@ import os.path as osp
 
 from detectorfreesfm.sfm_runner.utils.make_database import load_intrin_to_database
 from loguru import logger
+from natsort import natsorted
+from .utils.chunking import split_image_chunks
 from .utils.database import COLMAPDatabase
 from .triangulation import (
     import_features, import_matches, estimation_and_geometric_verification,
@@ -78,7 +80,112 @@ def _prior_mapper_options(colmap_configs):
     return opts
 
 
-def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs, verbose=False):
+def _build_mapper_cmd(database_path, image_dir, output_path, colmap_configs,
+                      image_list_path: Optional[Path] = None):
+    cmd = [COLMAP_PATH, "mapper"]
+    cmd += ["--image_path", str(image_dir)]
+    cmd += ["--database_path", str(database_path)]
+    cmd += ["--output_path", str(output_path)]
+    if image_list_path is not None:
+        # 登録対象を制限するのは Mapper 配下のオプション（トップレベルの
+        # --image_list_path は automatic_reconstructor 専用で mapper には無い）
+        cmd += ["--Mapper.image_list_path", str(image_list_path)]
+    if colmap_configs is not None and "min_model_size" in colmap_configs:
+        cmd += ["--Mapper.min_model_size", str(colmap_configs["min_model_size"])]
+    cmd += ["--Mapper.num_threads", str(min(multiprocessing.cpu_count(), colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16))]
+
+    if colmap_configs['use_pba']:
+        logger.warning("PBA (--Mapper.ba_global_use_pba) is not supported by stock COLMAP 4.1.0; ignoring use_pba.")
+
+    if colmap_configs.get('ba_backend') == 'CASPAR':
+        # GPU BA バックエンド（COLMAP を -DCASPAR_ENABLED=ON でビルドした
+        # 場合のみ有効）。CASPAR は glog の WARNING をフレーム毎に大量に
+        # 吐き /tmp のファイルログが GB 級になるため stderr のみへ抑制する
+        cmd += [
+            "--Mapper.ba_local_backend", "CASPAR",
+            "--Mapper.ba_global_backend", "CASPAR",
+            "--log_target", "stderr",
+        ]
+
+    if colmap_configs['colmap_mapper_cfgs'] is not None:
+        for config_name, value in colmap_configs["colmap_mapper_cfgs"].items():
+            if config_name in NOT_EXPO_COLMAP_CFGS:
+                cmd += [NOT_EXPO_COLMAP_CFGS[config_name], str(value)]
+
+    if (
+        colmap_configs is not None
+        and colmap_configs["no_refine_intrinsics"] is True
+    ):
+        cmd += [
+            "--Mapper.ba_refine_focal_length",
+            "0",
+            "--Mapper.ba_refine_extra_params",
+            "0",
+        ]
+    return cmd
+
+
+def _run_mapper_logged(cmd, models_path):
+    """mapper を実行し stdout/stderr を models_path/output.txt へ追記する。
+
+    失敗しても raise しない（呼び出し側はモデル 0 個の既存フォールバックで
+    処理を継続できる）。"""
+    logger.info(' '.join(cmd))
+    colmap_res = subprocess.run(cmd, capture_output=True)
+    with open(osp.join(models_path, "output.txt"), "a") as f:
+        f.write(colmap_res.stdout.decode())
+        f.write(colmap_res.stderr.decode())
+    if colmap_res.returncode != 0:
+        logger.error(f"COLMAP mapper failed with exit code {colmap_res.returncode}:\n"
+                     f"{colmap_res.stderr.decode()}")
+
+
+def _run_chunked_mapper(models_path, database_path, image_dir, image_list,
+                        chunk_size, colmap_configs):
+    """画像リストを時系列チャンクへ等分し、チャンクごとに独立した mapper を実行する。
+
+    共有 database.db に対し --Mapper.image_list_path で登録対象を制限する。チャンク間の
+    モデル統合は行わず、生成モデルを models_path 直下の連番ディレクトリへ平坦化
+    する（チャンク間の座標合わせは下流のフラグメント単位 IMU/PDR アラインに
+    任せる）。1 チャンクの失敗は残りのチャンクの実行を妨げない。
+    """
+    chunks = split_image_chunks(natsorted(image_list), chunk_size)
+    logger.info(f"Chunked mapper: {len(image_list)} images > mapper_chunk_size={chunk_size}"
+                f" -> {len(chunks)} chunks")
+
+    chunk_model_records = []
+    next_id = 0
+    for k, chunk in enumerate(chunks):
+        logger.info(f"[chunk {k}/{len(chunks)}] {len(chunk)} images: {chunk[0]} .. {chunk[-1]}")
+        chunk_dir = models_path / f"chunk_{k}"
+        chunk_dir.mkdir(exist_ok=True, parents=True)
+        image_list_path = chunk_dir / "image_list.txt"
+        image_list_path.write_text("\n".join(chunk) + "\n")
+
+        cmd = _build_mapper_cmd(database_path, image_dir, chunk_dir, colmap_configs,
+                                image_list_path=image_list_path)
+        _run_mapper_logged(cmd, models_path)
+
+        model_dirs = sorted(
+            (p for p in chunk_dir.iterdir() if p.is_dir() and p.name.isdigit()),
+            key=lambda p: int(p.name))
+        for model_dir in model_dirs:
+            shutil.move(str(model_dir), str(models_path / str(next_id)))
+            chunk_model_records.append((next_id, k, len(chunk), chunk[0], chunk[-1]))
+            logger.info(f"model {next_id} <- chunk {k} ({len(chunk)} images)")
+            next_id += 1
+        # chunk_* を残すと後段の mv で colmap_coarse へ漏れ、モデルディレクトリは
+        # 整数名のみという下流 (_colmap_to_pandas) の前提が壊れる
+        shutil.rmtree(chunk_dir)
+
+    with open(models_path / "mapper_chunks.txt", "w") as f:
+        f.write("model_id\tchunk\tchunk_num_images\tchunk_first_image\tchunk_last_image\n")
+        for record in chunk_model_records:
+            f.write("\t".join(str(v) for v in record) + "\n")
+
+
+def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs, verbose=False,
+                       image_list: Optional[List[str]] = None):
     models_path = sfm_dir / 'models'
 
     models_path.mkdir(exist_ok=True, parents=True)
@@ -111,56 +218,33 @@ def run_reconstruction(sfm_dir, database_path, image_dir, colmap_configs, verbos
                     mapper_options,)
     else:
         logger.info(f"Use command line COLMAP for reconstruction...")
-        cmd = [COLMAP_PATH, "mapper"]
-        cmd += ["--image_path", str(image_dir)]
-        cmd += ["--database_path", str(database_path)]
-        cmd += ["--output_path", str(models_path)]
-        if colmap_configs is not None and "min_model_size" in colmap_configs:
-            cmd += ["--Mapper.min_model_size", str(colmap_configs["min_model_size"])]
-        cmd += ["--Mapper.num_threads", str(min(multiprocessing.cpu_count(), colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16))]
+        chunk_size = colmap_configs.get('mapper_chunk_size') or 0
+        supplement_prefix = colmap_configs.get('supplement_data_prefix') or ''
+        has_supplement = bool(supplement_prefix) and any(
+            name.startswith(supplement_prefix) for name in (image_list or []))
+        if chunk_size > 0 and not image_list:
+            logger.warning("mapper_chunk_size が指定されていますが image_list が"
+                           "渡されていないため分割せずに実行します")
+        if chunk_size > 0 and has_supplement:
+            # 時系列分割すると images_ref/ の補完フレームが 1 チャンクへ固まり
+            # 新旧データの共登録が成立しなくなるため、調整 run は分割対象外
+            logger.warning("補完データ (images_ref) を含む調整 run のため "
+                           "mapper のチャンク分割をスキップします")
+        if chunk_size > 0 and image_list and len(image_list) > chunk_size and not has_supplement:
+            _run_chunked_mapper(models_path, database_path, image_dir,
+                                image_list, chunk_size, colmap_configs)
+        else:
+            cmd = _build_mapper_cmd(database_path, image_dir, models_path, colmap_configs)
+            _run_mapper_logged(cmd, models_path)
 
-        if colmap_configs['use_pba']:
-            logger.warning("PBA (--Mapper.ba_global_use_pba) is not supported by stock COLMAP 4.1.0; ignoring use_pba.")
-
-        if colmap_configs.get('ba_backend') == 'CASPAR':
-            # GPU BA バックエンド（COLMAP を -DCASPAR_ENABLED=ON でビルドした
-            # 場合のみ有効）。CASPAR は glog の WARNING をフレーム毎に大量に
-            # 吐き /tmp のファイルログが GB 級になるため stderr のみへ抑制する
-            cmd += [
-                "--Mapper.ba_local_backend", "CASPAR",
-                "--Mapper.ba_global_backend", "CASPAR",
-                "--log_target", "stderr",
-            ]
-
-        if colmap_configs['colmap_mapper_cfgs'] is not None:
-            for config_name, value in colmap_configs["colmap_mapper_cfgs"].items():
-                if config_name in NOT_EXPO_COLMAP_CFGS:
-                    cmd += [NOT_EXPO_COLMAP_CFGS[config_name], str(value)]
-
-        if (
-            colmap_configs is not None
-            and colmap_configs["no_refine_intrinsics"] is True
-        ):
-            cmd += [
-                "--Mapper.ba_refine_focal_length",
-                "0",
-                "--Mapper.ba_refine_extra_params",
-                "0",
-            ]
-
-        logger.info(' '.join(cmd))
-        colmap_res = subprocess.run(cmd, capture_output=True)
-        with open(osp.join(models_path, "output.txt"), "w") as f:
-            f.write(colmap_res.stdout.decode())
-            f.write(colmap_res.stderr.decode())
-        if colmap_res.returncode != 0:
-            logger.error(f"COLMAP mapper failed with exit code {colmap_res.returncode}:\n"
-                         f"{colmap_res.stderr.decode()}")
-
-        reconstructions = {}
-        for id, model_path in enumerate(sorted(models_path.glob('*'))):
-            if model_path.is_dir():
-                reconstructions[id] = pycolmap.Reconstruction(model_path)
+        # モデルディレクトリ名を id に使う（辞書順 enumerate だとモデルが
+        # 10 個を超えた際に "10" < "2" で id とディレクトリ名がずれ、
+        # 後段のマージループが別モデルを読んでしまう）
+        reconstructions = {
+            int(model_path.name): pycolmap.Reconstruction(model_path)
+            for model_path in models_path.iterdir()
+            if model_path.is_dir() and model_path.name.isdigit()
+        }
 
     if len(reconstructions) == 0:
         logger.error('Could not reconstruct any model!')
@@ -308,30 +392,52 @@ def _cluster_and_refine_models(models_path, colmap_configs):
     logger.info(f"Model clustering done: {len(staged)} final model(s)")
 
 
+# Reconstruction::Write が書き出すモデル実体。project.ini は COLMAP が書かないため
+# 置き換え対象から外す（下流がモデル dir に project.ini がある前提のため）
+_MODEL_FILES = ("cameras.bin", "images.bin", "points3D.bin", "rigs.bin", "frames.bin")
+
+
 def merge_reconstruction(input_path1, input_path2, output_path, log_path, colmap_configs=None):
-    cmd = [COLMAP_PATH, "model_merger"]
-    cmd += ["--input_path1", str(input_path1)]
-    cmd += ["--input_path2", str(input_path2)]
-    cmd += ["--output_path", str(output_path)]
+    """2 つのモデルを統合し、成功したときだけ output_path を置き換える。
+
+    colmap model_merger は input2 側へ統合した結果を、成功・失敗に関わらず
+    output_path へ書き出して EXIT_SUCCESS を返す（失敗時の中身は input2 のまま）。
+    呼び出し側は output_path に大きい方のモデルを指定するので、直接書かせると
+    統合失敗時に大きいモデルが小さいモデルで上書きされて消える。さらに COLMAP は
+    成否を stderr へ吐くため、stdout だけを見る判定では失敗を検出できない。
+    一時ディレクトリーへ出力し、stdout と stderr の両方で成功を確認してから反映する。
+    """
+    output_path = Path(output_path)
+    merge_tmp = Path(log_path).parent / "merge_tmp"
+    shutil.rmtree(merge_tmp, ignore_errors=True)
+    merge_tmp.mkdir(parents=True)
+    try:
+        cmd = [COLMAP_PATH, "model_merger",
+               "--input_path1", str(input_path1),
+               "--input_path2", str(input_path2),
+               "--output_path", str(merge_tmp)]
+        colmap_res = subprocess.run(cmd, capture_output=True)
+        merge_output = colmap_res.stdout.decode() + colmap_res.stderr.decode()
+        with open(osp.join(log_path, "output.txt"), "a") as f:
+            f.write(merge_output)
+
+        if colmap_res.returncode != 0 or "Merge succeeded" not in merge_output:
+            logger.error(f"Merge failed ({input_path1} + {input_path2}); "
+                         "元のモデルを維持します")
+            return False
+
+        for name in _MODEL_FILES:
+            src = merge_tmp / name
+            if src.exists():
+                shutil.copy2(src, output_path / name)
+    finally:
+        shutil.rmtree(merge_tmp, ignore_errors=True)
 
     cmd2 = [COLMAP_PATH, "bundle_adjuster"]
     cmd2 += ["--input_path", str(output_path)]
     cmd2 += ["--output_path", str(output_path)]
     cmd2 += _ba_backend_args(colmap_configs)
-
-    colmap_res = subprocess.run(cmd, capture_output=True)
-    # logger.info(' '.join(cmd))
-    merge_output = colmap_res.stdout.decode()
-    with open(osp.join(log_path, "output.txt"), "a") as f:
-        f.write(merge_output)
-
-    if "Merge failed" in merge_output:
-        logger.error(f"Merge failed: {merge_output}")
-        return False
-    colmap_res = subprocess.run(cmd2, capture_output=True)
-    # logger.info(' '.join(cmd2))
-    with open(osp.join(log_path, "output.txt"), "a") as f:
-        f.write(colmap_res.stdout.decode())
+    _run_colmap_logged(cmd2, log_path)
     return True
 
 def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
@@ -389,7 +495,8 @@ def main(sfm_dir, image_dir, pairs, features, matches, prior_intrin,
         # 1 件も注入できなければ従来マッパーへフォールバック
         colmap_configs['use_prior_position'] = n_prior > 0
 
-    reconstruction = run_reconstruction(sfm_dir, database, image_dir, colmap_configs=colmap_configs)
+    reconstruction = run_reconstruction(sfm_dir, database, image_dir, colmap_configs=colmap_configs,
+                                        image_list=image_list)
     if reconstruction is not None and verbose:
         logger.info(f'Reconstruction statistics:\n{reconstruction.summary()}'
                     + f'\n\tnum_input_images = {len(image_ids)}')
